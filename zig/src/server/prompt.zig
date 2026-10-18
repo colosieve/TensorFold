@@ -14,6 +14,12 @@ const Cx = errors.Cx;
 /// With image input, `ids` holds each image's tokens, `images` the images and `cache_key` the prompt the cache matches.
 pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{} };
 
+/// Whether the generation prompt leaves a think block open for the reply: its last few tokens hold `<think>`.
+pub fn opensThink(srv: *const Server, ids: []const u32) bool {
+    const open = srv.text.tokenId("<think>") orelse return false;
+    return std.mem.indexOfScalar(u32, ids[ids.len -| 3..], open) != null;
+}
+
 /// Where lessons decide to act on a reply: the row before the generation prompt's `<think>`, else before its last.
 pub fn decideOf(srv: *const Server, ids: []const u32) u32 {
     if (srv.text.tokenId("<think>")) |open| {

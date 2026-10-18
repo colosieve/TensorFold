@@ -78,6 +78,9 @@ pub const Request = struct {
     think_budget: u32 = 0,
     think_close: []const u32 = &.{},
     think_end: ?u32 = null,
+    /// The prompt opened the reply's think block (the generation prompt ends in the template's opener). With
+    /// ``think_close`` set, an engine that sees the reply end inside the block may write the close and go on.
+    think_open_at_start: bool = false,
     /// The offered tools as JSON text, for drafters that propose a call's structure; empty: no tools.
     tools_json: []const u8 = "",
     /// Set only when ``Info`` says the engine enforces it.

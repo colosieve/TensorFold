@@ -23,6 +23,10 @@ const Job = struct {
     cached: u32 = 0, // prompt tokens restored from the prompt cache
     restore_ns: i96 = 0, // the cache's lookup and restore before the prompt pass
     keep_ns: i96 = 0, // the cache's saves at the pass's marks
+    // An end token inside the think block the prompt opened becomes the block's close: the reply goes on to an answer.
+    close_guard: bool = false, // armed for this reply (thinking, the close known, one Mac)
+    think_closed: bool = false, // the reply wrote the think end (or the guard wrote the close)
+    close_pending: bool = false, // an end token arrived inside the block: serve writes the close and continues
 };
 
 /// The engine's thread owns the GPU; requests wait their turn, foreground first, each in arrival order.
@@ -283,6 +287,11 @@ pub const Host = struct {
             emit(c.job, .{ .prefilled = c.job.cached });
         }
 
+        /// The close's continuation pass: the reply's prompt pass already reported.
+        fn prefilledAgain(ctx: *anyopaque) void {
+            _ = ctx;
+        }
+
         fn marked(ctx: *anyopaque, at: usize) void {
             const c: *Ctx = @ptrCast(@alignCast(ctx));
             const t0 = c.h.now();
@@ -296,6 +305,16 @@ pub const Host = struct {
             var matched = false;
             var n: usize = 0;
             for (toks) |t| { // stop strings are checked after each token, as the lane core does
+                if (job.close_guard and !job.think_closed) {
+                    if (job.request.think_end) |end| if (t == end) {
+                        job.think_closed = true;
+                    };
+                    if (!job.think_closed and std.mem.indexOfScalar(u32, job.request.eos, t) != null) {
+                        job.close_pending = true; // not emitted: this pass stops here and serve writes the close
+                        matched = true;
+                        break;
+                    }
+                }
                 job.emitted.append(c.h.gpa, t) catch return true;
                 n += 1;
                 if (job.request.stop) |s| if (s.check(s.ctx, job.emitted.items)) {
@@ -348,6 +367,7 @@ pub const Host = struct {
         };
         const depth: ?usize = if (r.drafts) null else 0;
         const budget: fx.Think = if (r.think_budget > 0) .{ .budget = r.think_budget, .close = r.think_close, .end = r.think_end } else .{};
+        job.close_guard = r.think_open_at_start and r.think_close.len > 0 and r.think_end != null and h.eng.r.tp == null;
         var arena: std.heap.ArenaAllocator = .init(h.gpa);
         defer arena.deinit();
         var plan: pc.Plan = .{};
@@ -381,12 +401,41 @@ pub const Host = struct {
             return;
         };
         if (!job.prefill_sent) emit(job, .{ .prefilled = 0 });
-        fin.reason = switch (res.reason) {
+        var reason = res.reason;
+        var rounds = res.rounds;
+        var drafted = res.drafted;
+        var accepted = res.accepted;
+        var min_rows = res.min_rows;
+        if (job.close_pending) close: {
+            // The reply ended on an end token inside its think block: the close takes the end token's place, as the
+            // thinking budget's does, and a second pass over the prompt and the reply so far writes the answer.
+            job.close_pending = false;
+            job.think_closed = true;
+            std.log.info("reply ended inside its think block after {d} tokens: closing it and continuing", .{job.emitted.items.len});
+            const more_out: fx.Out = .{ .ctx = &c, .prefilled = Ctx.prefilledAgain, .tokens = Ctx.tokens, .cancelled = Ctx.cancelled, .marked = Ctx.marked, .sampling = sampled };
+            if (Ctx.tokens(&c, r.think_close)) break :close; // a stop string matched inside the close
+            const used = job.emitted.items.len;
+            if (used >= r.max_tokens) {
+                reason = .length;
+                break :close;
+            }
+            const next = std.mem.concat(arena.allocator(), u32, &.{ r.prompt, job.emitted.items }) catch break :close;
+            const more = h.eng.generateFrom(next, 0, &.{}, r.max_tokens - used, r.eos, depth, .{}, more_out) catch |e| {
+                std.log.warn("think close continuation failed ({s}); the reply ends with its reasoning", .{@errorName(e)});
+                break :close;
+            };
+            reason = more.reason;
+            rounds += more.rounds;
+            drafted += more.drafted;
+            accepted += more.accepted;
+            min_rows = @min(min_rows, more.min_rows);
+        }
+        fin.reason = switch (reason) {
             .stop => .stop,
             .length => .length,
             .cancelled => .cancelled,
         };
-        fin.stats = .{ .rounds = res.rounds, .drafted = res.drafted, .accepted = res.accepted, .min_rows = res.min_rows, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null };
+        fin.stats = .{ .rounds = rounds, .drafted = drafted, .accepted = accepted, .min_rows = min_rows, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null };
     }
 };
 

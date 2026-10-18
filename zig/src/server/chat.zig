@@ -151,10 +151,13 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         if (budget > 0 and !srv.info.thinking_budget)
             return cx.refuse("thinking_budget is not supported by this native engine");
         if (srv.think_close.len > 0) request.loop_guard = srv.config.loop_guard;
-        if ((budget > 0 or request.loop_guard) and srv.think_close.len > 0) {
+        // The close travels with every thinking request: engines act on it only with a budget, a loop guard, or
+        // (where they support it) a reply that ends inside the block the prompt opened.
+        if (srv.think_close.len > 0) {
             if (budget > 0) request.think_budget = @intCast(@min(budget, std.math.maxInt(u32)));
             request.think_close = srv.think_close;
             request.think_end = srv.think_close_end;
+            request.think_open_at_start = prompt_mod.opensThink(srv, rendered.ids);
         }
     }
     if (input.logprobs) |count| request.logprobs = try @import("logprobs.zig").admit(srv, cx, thinking, request.think_budget, count);
